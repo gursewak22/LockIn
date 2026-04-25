@@ -15,12 +15,12 @@
   </style>
 </head>
 <body>
-  <h1>YT Tile Scraper</h1>
+  <h1>LockIn Content Filter</h1>
   <label>Mode
     <select id="mode">
       <option value="lookahead" selected>lookahead (3000px below fold)</option>
       <option value="strict">strict (visible only)</option>
-      <option value="all">all (everything in DOM)</option>
+      <option value="all">all (materialized in DOM)</option>
     </select>
   </label>
   <label>Receiver
@@ -34,7 +34,7 @@
     <button id="watch">Watch off</button>
   </div>
   <div id="status"></div>
-  <small>Run: <code>python scrapper/yt_receiver.py</code></small>
+  <small>Run receiver: <code>python scrapper/yt_receiver.py</code></small>
   <script src="popup.js"></script>
 </body>
 </html>

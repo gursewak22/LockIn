@@ -1,5 +1,5 @@
 // Background service worker. Handles recurring "watch" scrapes via chrome.alarms,
-// since popups close as soon as the user clicks away.
+// and applies topic-based overlays on the active web tab.
 
 const ALARM_NAME = "yt-scrape-watch";
 const DEFAULT_ENDPOINT = "http://127.0.0.1:8765/tiles";
@@ -15,7 +15,7 @@ function applyOverlayFn({ blockedVideoIds, blockedItemKeys }) {
     try {
       const u = new URL(url, location.origin);
       const keep = new URLSearchParams();
-      for (const key of ["v", "list", "p", "q"]) {
+      for (const key of ["v", "list", "p", "q", "query", "k", "tbm", "search_query"]) {
         const val = u.searchParams.get(key);
         if (val) keep.set(key, val);
       }
@@ -40,6 +40,13 @@ function applyOverlayFn({ blockedVideoIds, blockedItemKeys }) {
     const norm = normalizeUrl(url);
     return norm ? `url:${norm}` : "";
   };
+  const isUiChrome = (el) => {
+    if (!el || !(el instanceof Element)) return true;
+    if (el.matches("html, body, main, header, nav, aside, footer, form")) return true;
+    if (el.closest("header, nav, aside, footer, form, [role='search'], [role='navigation'], [role='toolbar']")) return true;
+    if (el.querySelector("input, textarea, select, [contenteditable='true']")) return true;
+    return false;
+  };
 
   // Reset previous overlays so each pass reflects the latest classifier output.
   for (const old of document.querySelectorAll(".lockin-overlay")) old.remove();
@@ -54,6 +61,14 @@ function applyOverlayFn({ blockedVideoIds, blockedItemKeys }) {
   if (blockedVideos.size === 0 && blockedKeys.size === 0) return { blockedCount: 0 };
 
   const hostSelectors = [
+    ".g",
+    "[data-sokoban-container]",
+    "[data-testid='tweet']",
+    "[data-testid='cellInnerDiv']",
+    "[role='article']",
+    "article",
+    "li",
+    "section",
     "ytd-rich-item-renderer",
     "ytd-rich-grid-media",
     "ytd-video-renderer",
@@ -92,6 +107,14 @@ function applyOverlayFn({ blockedVideoIds, blockedItemKeys }) {
 
   const maybeBlockHost = (host) => {
     if (!host) return false;
+    if (isUiChrome(host)) return false;
+
+    const rect = host.getBoundingClientRect();
+    const vpW = window.innerWidth || document.documentElement.clientWidth;
+    const vpH = window.innerHeight || document.documentElement.clientHeight;
+    // Avoid blanketing whole-app containers.
+    if (rect.width > vpW * 0.98 || rect.height > vpH * 0.9) return false;
+
     const links = host.querySelectorAll("a[href]");
     let shouldBlock = false;
     for (const a of links) {
@@ -117,12 +140,46 @@ function applyOverlayFn({ blockedVideoIds, blockedItemKeys }) {
     return true;
   };
 
+  const pickGenericHost = (anchor) => {
+    let el = anchor;
+    for (let i = 0; i < 7 && el && el !== document.body; i++) {
+      if (isUiChrome(el)) {
+        el = el.parentElement;
+        continue;
+      }
+      const rect = el.getBoundingClientRect();
+      const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+      const vpW = window.innerWidth || document.documentElement.clientWidth;
+      const vpH = window.innerHeight || document.documentElement.clientHeight;
+      if (area >= 10000 && rect.width <= vpW * 0.98 && rect.height <= vpH * 0.9) return el;
+      el = el.parentElement;
+    }
+    return anchor.parentElement || anchor;
+  };
+
   let blockedCount = 0;
   const seenHosts = new Set();
   for (const host of document.querySelectorAll(hostSelectors.join(","))) {
     if (seenHosts.has(host)) continue;
     seenHosts.add(host);
     if (maybeBlockHost(host)) blockedCount += 1;
+  }
+
+  // Generic fallback for sites that don't expose card-like host tags.
+  if (blockedCount === 0 || blockedKeys.size > 0) {
+    for (const a of document.querySelectorAll("a[href]")) {
+      if (a.closest("header, nav, aside, footer, form, [role='search'], [role='navigation'], [role='toolbar']")) continue;
+      const raw = a.getAttribute("href") || "";
+      let full = "";
+      try { full = new URL(raw, location.origin).toString(); } catch (_) { full = raw; }
+      const vid = videoIdFromUrl(full);
+      const key = itemKeyFromUrl(full);
+      if (!((vid && blockedVideos.has(vid)) || (key && blockedKeys.has(key)))) continue;
+      const host = pickGenericHost(a);
+      if (!host || seenHosts.has(host)) continue;
+      seenHosts.add(host);
+      if (maybeBlockHost(host)) blockedCount += 1;
+    }
   }
 
   return { blockedCount };
@@ -154,7 +211,19 @@ function scrapeFn({ mode, lookahead }) {
     "yt-lockup-view-model",
     "ytm-shorts-lockup-view-model",
   ];
+  const GENERIC_SELECTORS = [
+    "article",
+    "main li",
+    "main div",
+    "section",
+    ".g",
+    "[role='article']",
+    "[data-testid='cellInnerDiv']",
+    "[data-testid='tweet']",
+  ];
   const TITLE_SEL = [
+    "h1", "h2", "h3", "h4",
+    "a[title]",
     "#video-title-link", "a#video-title", "#video-title",
     "h3 a#video-title-link", "h3 #video-title",
     "yt-formatted-string#video-title",
@@ -163,6 +232,9 @@ function scrapeFn({ mode, lookahead }) {
     "h3 .yt-core-attributed-string",
   ];
   const CHANNEL_SEL = [
+    "[class*='author']",
+    "[class*='channel']",
+    "[class*='byline']",
     "ytd-channel-name #text a", "ytd-channel-name #text", "ytd-channel-name a",
     "#channel-name #text", "#channel-name a",
     "#byline a", "#byline", ".ytd-channel-name",
@@ -170,6 +242,9 @@ function scrapeFn({ mode, lookahead }) {
     ".yt-content-metadata-view-model-wiz__metadata-text",
   ];
   const DESC_SEL = [
+    "p",
+    "[class*='snippet']",
+    "[class*='description']",
     "#description-text", "yt-formatted-string#description-text",
     ".metadata-snippet-text", "#description",
   ];
@@ -183,6 +258,13 @@ function scrapeFn({ mode, lookahead }) {
       if (cleaned) return cleaned;
     }
     return "";
+  };
+  const isUiChrome = (el) => {
+    if (!el || !(el instanceof Element)) return true;
+    if (el.matches("html, body, main, header, nav, aside, footer, form")) return true;
+    if (el.closest("header, nav, aside, footer, form, [role='search'], [role='navigation'], [role='toolbar']")) return true;
+    if (el.querySelector("input, textarea, select, [contenteditable='true']")) return true;
+    return false;
   };
   const firstHref = (el) => {
     const cand = el.querySelector(
@@ -198,7 +280,7 @@ function scrapeFn({ mode, lookahead }) {
     try {
       const u = new URL(url, location.origin);
       const keep = new URLSearchParams();
-      for (const key of ["v", "list", "p", "q"]) {
+      for (const key of ["v", "list", "p", "q", "query", "k", "tbm", "search_query"]) {
         const val = u.searchParams.get(key);
         if (val) keep.set(key, val);
       }
@@ -247,12 +329,13 @@ function scrapeFn({ mode, lookahead }) {
     return true; // "all"
   };
 
-  for (const sel of SELECTORS) {
+  for (const sel of [...SELECTORS, ...GENERIC_SELECTORS]) {
     const nodes = document.querySelectorAll(sel);
     counts.by_selector[sel] = nodes.length;
     for (const el of nodes) {
       if (seenEls.has(el)) continue;
       seenEls.add(el);
+      if (isUiChrome(el)) continue;
       if (!passesViewport(el.getBoundingClientRect())) continue;
 
       const url = firstHref(el);
@@ -283,23 +366,25 @@ function scrapeFn({ mode, lookahead }) {
     }
   }
 
-  // Wide scan: include all visible YouTube links as content candidates.
+  // Wide scan: include all visible links as content candidates.
   counts.fallback_used = true;
   const links = document.querySelectorAll("a[href]");
   counts.fallback_links = links.length;
   for (const a of links) {
+    if (a.closest("header, nav, aside, footer, form, [role='search'], [role='navigation'], [role='toolbar']")) continue;
     const url = (() => {
       try { return new URL(a.getAttribute("href"), location.origin).toString(); }
       catch (_) { return a.href || ""; }
     })();
-    if (!url || !url.includes("youtube.com")) continue;
+    if (!url || url.startsWith("javascript:") || url.startsWith("mailto:")) continue;
     const vid = videoIdFromUrl(url);
     const text = (a.getAttribute("title") || a.textContent || "").replace(/\s+/g, " ").trim();
     const itemKey = itemKeyFrom(url, vid, text);
     if (!itemKey || seenKeys.has(itemKey)) continue;
 
     // Find the smallest containing card-ish ancestor to read title + channel from.
-    const card = a.closest(SELECTORS.join(",")) || a.parentElement || a;
+    const card = a.closest([...SELECTORS, ...GENERIC_SELECTORS].join(",")) || a.parentElement || a;
+    if (isUiChrome(card)) continue;
 
     if (!passesViewport(card.getBoundingClientRect())) continue;
     const channel = firstText(card, CHANNEL_SEL);
@@ -327,14 +412,12 @@ function scrapeFn({ mode, lookahead }) {
   return { tiles: out, counts };
 }
 
-async function getYouTubeTab() {
-  const tabs = await chrome.tabs.query({});
-  const yt = tabs.filter((t) => t.url && /youtube\.com/.test(t.url));
-  if (yt.length === 0) return null;
-  const active = yt.find((t) => t.active);
-  if (active) return active;
-  yt.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
-  return yt[0];
+async function getActiveWebTab() {
+  const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  const tab = tabs && tabs[0];
+  if (!tab || !tab.url) return null;
+  if (!/^https?:\/\//.test(tab.url)) return null;
+  return tab;
 }
 
 async function scrapeAndSend() {
@@ -343,9 +426,9 @@ async function scrapeAndSend() {
     mode = DEFAULT_MODE,
     topic = "",
   } = await chrome.storage.local.get(["endpoint", "mode", "topic"]);
-  const tab = await getYouTubeTab();
+  const tab = await getActiveWebTab();
   if (!tab) {
-    return { ok: false, reason: "No YouTube tab open." };
+    return { ok: false, reason: "No active HTTP(S) tab. Open a normal web page and try again." };
   }
   let scrapeResult = { tiles: [], counts: {} };
   try {
