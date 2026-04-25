@@ -6,8 +6,40 @@ const DEFAULT_ENDPOINT = "http://127.0.0.1:8765/tiles";
 const DEFAULT_MODE = "lookahead";
 const DEFAULT_INTERVAL_MIN = 0.05;
 
-function applyOverlayFn({ blockedVideoIds }) {
-  const blocked = new Set((blockedVideoIds || []).filter(Boolean));
+function applyOverlayFn({ blockedVideoIds, blockedItemKeys }) {
+  const blockedVideos = new Set((blockedVideoIds || []).filter(Boolean));
+  const blockedKeys = new Set((blockedItemKeys || []).filter(Boolean));
+
+  const normalizeUrl = (url) => {
+    if (!url) return "";
+    try {
+      const u = new URL(url, location.origin);
+      const keep = new URLSearchParams();
+      for (const key of ["v", "list", "p", "q"]) {
+        const val = u.searchParams.get(key);
+        if (val) keep.set(key, val);
+      }
+      const qs = keep.toString();
+      return `${u.origin}${u.pathname}${qs ? "?" + qs : ""}`;
+    } catch (_) {
+      return "";
+    }
+  };
+  const videoIdFromUrl = (url) => {
+    if (!url) return "";
+    try {
+      const u = new URL(url, location.origin);
+      const v = u.searchParams.get("v");
+      if (v) return v;
+      const m = u.pathname.match(/\/shorts\/([^/?#]+)/);
+      if (m) return m[1];
+    } catch (_) {}
+    return "";
+  };
+  const itemKeyFromUrl = (url) => {
+    const norm = normalizeUrl(url);
+    return norm ? `url:${norm}` : "";
+  };
 
   // Reset previous overlays so each pass reflects the latest classifier output.
   for (const old of document.querySelectorAll(".lockin-overlay")) old.remove();
@@ -19,15 +51,20 @@ function applyOverlayFn({ blockedVideoIds }) {
     }
   }
 
-  if (blocked.size === 0) return { blockedCount: 0 };
+  if (blockedVideos.size === 0 && blockedKeys.size === 0) return { blockedCount: 0 };
 
   const hostSelectors = [
     "ytd-rich-item-renderer",
+    "ytd-rich-grid-media",
     "ytd-video-renderer",
     "ytd-grid-video-renderer",
     "ytd-compact-video-renderer",
     "ytd-playlist-video-renderer",
     "ytd-reel-item-renderer",
+    "ytd-reel-shelf-renderer",
+    "ytd-shorts",
+    "ytd-shorts-lockup-view-model",
+    "ytm-shorts-lockup-view-model",
     "yt-lockup-view-model",
   ];
 
@@ -53,29 +90,39 @@ function applyOverlayFn({ blockedVideoIds }) {
     return d;
   };
 
-  const seenHosts = new Set();
-  let blockedCount = 0;
-
-  for (const vid of blocked) {
-    const esc = (window.CSS && CSS.escape) ? CSS.escape(vid) : vid;
-    const links = [
-      ...document.querySelectorAll(`a[href*='watch?v=${esc}']`),
-      ...document.querySelectorAll(`a[href*='/shorts/${esc}']`),
-    ];
+  const maybeBlockHost = (host) => {
+    if (!host) return false;
+    const links = host.querySelectorAll("a[href]");
+    let shouldBlock = false;
     for (const a of links) {
-      const host = a.closest(hostSelectors.join(","));
-      if (!host || seenHosts.has(host)) continue;
-      seenHosts.add(host);
-
-      const prevPos = getComputedStyle(host).position;
-      if (prevPos === "static") {
-        host.dataset.lockinPrevPosition = "static";
-        host.style.position = "relative";
+      const raw = a.getAttribute("href") || "";
+      let full = "";
+      try { full = new URL(raw, location.origin).toString(); } catch (_) { full = raw; }
+      const vid = videoIdFromUrl(full);
+      const key = itemKeyFromUrl(full);
+      if ((vid && blockedVideos.has(vid)) || (key && blockedKeys.has(key))) {
+        shouldBlock = true;
+        break;
       }
-      host.dataset.lockinBlocked = "1";
-      host.appendChild(makeOverlay());
-      blockedCount += 1;
     }
+    if (!shouldBlock) return false;
+
+    const prevPos = getComputedStyle(host).position;
+    if (prevPos === "static") {
+      host.dataset.lockinPrevPosition = "static";
+      host.style.position = "relative";
+    }
+    host.dataset.lockinBlocked = "1";
+    host.appendChild(makeOverlay());
+    return true;
+  };
+
+  let blockedCount = 0;
+  const seenHosts = new Set();
+  for (const host of document.querySelectorAll(hostSelectors.join(","))) {
+    if (seenHosts.has(host)) continue;
+    seenHosts.add(host);
+    if (maybeBlockHost(host)) blockedCount += 1;
   }
 
   return { blockedCount };
@@ -84,11 +131,26 @@ function applyOverlayFn({ blockedVideoIds }) {
 function scrapeFn({ mode, lookahead }) {
   const SELECTORS = [
     "ytd-rich-item-renderer",
+    "ytd-rich-grid-media",
     "ytd-video-renderer",
     "ytd-grid-video-renderer",
     "ytd-compact-video-renderer",
     "ytd-playlist-video-renderer",
+    "ytd-playlist-renderer",
+    "ytd-grid-playlist-renderer",
+    "ytd-compact-playlist-renderer",
+    "ytd-radio-renderer",
+    "ytd-compact-radio-renderer",
+    "ytd-movie-renderer",
+    "ytd-grid-movie-renderer",
+    "ytd-promoted-video-renderer",
+    "ytd-universal-watch-card-renderer",
+    "ytd-rich-shelf-renderer",
+    "ytd-shelf-renderer",
     "ytd-reel-item-renderer",
+    "ytd-reel-shelf-renderer",
+    "ytd-shorts",
+    "ytd-shorts-lockup-view-model",
     "yt-lockup-view-model",
     "ytm-shorts-lockup-view-model",
   ];
@@ -124,12 +186,34 @@ function scrapeFn({ mode, lookahead }) {
   };
   const firstHref = (el) => {
     const cand = el.querySelector(
-      "a#thumbnail[href], a#video-title-link[href], a#video-title[href], a.yt-lockup-metadata-view-model-wiz__title[href], a[href*='/watch?v='], a[href*='/shorts/']"
+      "a#thumbnail[href], a#video-title-link[href], a#video-title[href], a.yt-lockup-metadata-view-model-wiz__title[href], a[href*='/watch?v='], a[href*='/shorts/'], a[href*='/playlist?list='], a[href*='/browse/'], a[href]"
     );
     if (!cand) return "";
     const h = cand.getAttribute("href") || "";
     if (!h) return "";
     try { return new URL(h, location.origin).toString(); } catch (_) { return h; }
+  };
+  const normalizeUrl = (url) => {
+    if (!url) return "";
+    try {
+      const u = new URL(url, location.origin);
+      const keep = new URLSearchParams();
+      for (const key of ["v", "list", "p", "q"]) {
+        const val = u.searchParams.get(key);
+        if (val) keep.set(key, val);
+      }
+      const qs = keep.toString();
+      return `${u.origin}${u.pathname}${qs ? "?" + qs : ""}`;
+    } catch (_) {
+      return "";
+    }
+  };
+  const itemKeyFrom = (url, vid, fallback) => {
+    if (vid) return `video:${vid}`;
+    const norm = normalizeUrl(url);
+    if (norm) return `url:${norm}`;
+    const fb = (fallback || "").trim().toLowerCase().slice(0, 120);
+    return fb ? `text:${fb}` : "";
   };
   const videoIdFromUrl = (url) => {
     if (!url) return "";
@@ -152,6 +236,7 @@ function scrapeFn({ mode, lookahead }) {
   const counts = { viewport_h: vpH, mode, lookahead, page_url: location.href, by_selector: {}, kept: 0, fallback_used: false };
   const seenEls = new Set();
   const seenIds = new Set();
+  const seenKeys = new Set();
   const out = [];
   const ts = new Date().toISOString();
 
@@ -170,17 +255,21 @@ function scrapeFn({ mode, lookahead }) {
       seenEls.add(el);
       if (!passesViewport(el.getBoundingClientRect())) continue;
 
-      const title = firstText(el, TITLE_SEL);
-      const channel = firstText(el, CHANNEL_SEL);
-      if (!title && !channel) continue;
-
       const url = firstHref(el);
       const vid = videoIdFromUrl(url);
+      const title = firstText(el, TITLE_SEL);
+      const channel = firstText(el, CHANNEL_SEL);
+      // Shorts cards can be sparse; keep id-backed items even without readable metadata.
+      if (!title && !channel && !vid) continue;
+      const itemKey = itemKeyFrom(url, vid, `${title}|${channel}`);
       if (vid) {
         if (seenIds.has(vid)) continue;
         seenIds.add(vid);
       }
+      if (!itemKey || seenKeys.has(itemKey)) continue;
+      seenKeys.add(itemKey);
       out.push({
+        item_key: itemKey,
         video_id: vid,
         title,
         channel,
@@ -194,43 +283,42 @@ function scrapeFn({ mode, lookahead }) {
     }
   }
 
-  // Fallback: if structured selectors found nothing, scan every video link and synthesize tiles.
-  if (out.length === 0) {
-    counts.fallback_used = true;
-    const links = document.querySelectorAll("a[href*='/watch?v='], a[href*='/shorts/']");
-    counts.fallback_links = links.length;
-    for (const a of links) {
-      const url = (() => {
-        try { return new URL(a.getAttribute("href"), location.origin).toString(); }
-        catch (_) { return a.href || ""; }
-      })();
-      const vid = videoIdFromUrl(url);
-      if (!vid || seenIds.has(vid)) continue;
+  // Wide scan: include all visible YouTube links as content candidates.
+  counts.fallback_used = true;
+  const links = document.querySelectorAll("a[href]");
+  counts.fallback_links = links.length;
+  for (const a of links) {
+    const url = (() => {
+      try { return new URL(a.getAttribute("href"), location.origin).toString(); }
+      catch (_) { return a.href || ""; }
+    })();
+    if (!url || !url.includes("youtube.com")) continue;
+    const vid = videoIdFromUrl(url);
+    const text = (a.getAttribute("title") || a.textContent || "").replace(/\s+/g, " ").trim();
+    const itemKey = itemKeyFrom(url, vid, text);
+    if (!itemKey || seenKeys.has(itemKey)) continue;
 
-      // Find the smallest containing card-ish ancestor to read title + channel from.
-      let host = a;
-      for (let i = 0; i < 6 && host && host !== document.body; i++) host = host.parentElement;
-      const card = host || a.parentElement || a;
+    // Find the smallest containing card-ish ancestor to read title + channel from.
+    const card = a.closest(SELECTORS.join(",")) || a.parentElement || a;
 
-      if (!passesViewport(card.getBoundingClientRect())) continue;
+    if (!passesViewport(card.getBoundingClientRect())) continue;
+    const channel = firstText(card, CHANNEL_SEL);
+    if (!text && !channel && !vid) continue;
 
-      const title = (a.getAttribute("title") || a.textContent || "").replace(/\s+/g, " ").trim();
-      const channel = firstText(card, CHANNEL_SEL);
-      if (!title && !channel) continue;
-
-      seenIds.add(vid);
-      out.push({
-        video_id: vid,
-        title,
-        channel,
-        description: firstText(card, DESC_SEL),
-        thumbnail_url: firstThumb(card),
-        url,
-        tile_type: "fallback:link",
-        scraped_at: ts,
-        page_url: location.href,
-      });
-    }
+    if (vid) seenIds.add(vid);
+    seenKeys.add(itemKey);
+    out.push({
+      item_key: itemKey,
+      video_id: vid,
+      title: text,
+      channel,
+      description: firstText(card, DESC_SEL),
+      thumbnail_url: firstThumb(card),
+      url,
+      tile_type: "fallback:link",
+      scraped_at: ts,
+      page_url: location.href,
+    });
   }
 
   counts.kept = out.length;
@@ -291,12 +379,13 @@ async function scrapeAndSend() {
     const data = await resp.json().catch(() => ({}));
     const accepted = typeof data.accepted === "number" ? data.accepted : tiles.length;
     const blockedVideoIds = Array.isArray(data.blocked_video_ids) ? data.blocked_video_ids : [];
+    const blockedItemKeys = Array.isArray(data.blocked_item_keys) ? data.blocked_item_keys : [];
     let blockedOnPage = 0;
     try {
       const [{ result }] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: applyOverlayFn,
-        args: [{ blockedVideoIds }],
+        args: [{ blockedVideoIds, blockedItemKeys }],
       });
       blockedOnPage = Number(result && result.blockedCount) || 0;
     } catch (_) {

@@ -65,11 +65,13 @@ def llm_classify_irrelevant(state: State, topic: str, tiles: list[dict[str, Any]
 
     items: list[dict[str, str]] = []
     for t in tiles:
-        vid = (t.get("video_id") or "").strip()
-        if not vid:
+        item_key = (t.get("item_key") or t.get("video_id") or t.get("url") or "").strip()
+        if not item_key:
             continue
         items.append({
-            "video_id": vid,
+            "item_key": item_key,
+            "video_id": str(t.get("video_id") or "").strip(),
+            "url": str(t.get("url") or ""),
             "title": str(t.get("title") or ""),
             "channel": str(t.get("channel") or ""),
             "description": str(t.get("description") or ""),
@@ -79,12 +81,12 @@ def llm_classify_irrelevant(state: State, topic: str, tiles: list[dict[str, Any]
         return {}
 
     prompt = (
-        "You are a strict relevance filter for YouTube recommendations. "
-        "Given a user topic and a list of videos, return ONLY JSON object: "
-        "{\"irrelevant_ids\":[\"id1\",\"id2\"]}. "
-        "Mark as irrelevant if the video is not about the topic, only weakly related, clickbait, or off-topic. "
+        "You are a strict relevance filter for YouTube recommendations and content surfaces. "
+        "Given a user topic and a list of items, return ONLY JSON object: "
+        "{\"irrelevant_keys\":[\"key1\",\"key2\"]}. "
+        "Mark as irrelevant if the item is not about the topic, only weakly related, clickbait, or off-topic. "
         f"Topic: {topic}\n"
-        f"Videos: {json.dumps(items, ensure_ascii=False)}"
+        f"Items: {json.dumps(items, ensure_ascii=False)}"
     )
     payload = {
         "model": state.llm_model,
@@ -110,8 +112,8 @@ def llm_classify_irrelevant(state: State, topic: str, tiles: list[dict[str, Any]
         data = json.loads(raw)
         content = data["choices"][0]["message"]["content"]
         parsed = json.loads(content)
-        blocked = set(parsed.get("irrelevant_ids") or [])
-        return {v["video_id"]: (v["video_id"] in blocked) for v in items}
+        blocked = set(parsed.get("irrelevant_keys") or [])
+        return {v["item_key"]: (v["item_key"] in blocked) for v in items}
     except (KeyError, ValueError, urllib.error.URLError, TimeoutError):
         return {}
 
@@ -120,13 +122,13 @@ def classify_tiles(state: State, topic: str, tiles: list[dict[str, Any]]) -> dic
     llm_result = llm_classify_irrelevant(state, topic, tiles)
     out: dict[str, bool] = {}
     for t in tiles:
-        vid = (t.get("video_id") or "").strip()
-        if not vid:
+        key = (t.get("item_key") or t.get("video_id") or t.get("url") or "").strip()
+        if not key:
             continue
-        if vid in llm_result:
-            out[vid] = llm_result[vid]
+        if key in llm_result:
+            out[key] = llm_result[key]
         else:
-            out[vid] = heuristic_is_irrelevant(t, topic)
+            out[key] = heuristic_is_irrelevant(t, topic)
     return out
 
 
@@ -186,37 +188,49 @@ def make_handler(state: State):
 
             received_at = iso_now()
             accepted = 0
+            blocked_item_keys: list[str] = []
             blocked_video_ids: list[str] = []
             new_for_classify: list[dict[str, Any]] = []
-            all_video_ids: list[str] = []
+            all_keys: list[str] = []
             with state.lock:
                 state.total_received += len(tiles)
                 for t in tiles:
                     if not isinstance(t, dict):
                         continue
                     video_id = (t.get("video_id") or "").strip()
-                    key = video_id or (t.get("url") or "").strip()
-                    if video_id:
-                        all_video_ids.append(video_id)
+                    item_key = (t.get("item_key") or "").strip()
+                    key = item_key or video_id or (t.get("url") or "").strip()
+                    if key:
+                        all_keys.append(key)
                     if state.dedup:
                         if not key or key in state.seen:
-                            if video_id and state.relevance.get(video_id):
+                            if key and state.relevance.get(key):
+                                blocked_item_keys.append(key)
+                            if video_id and state.relevance.get(key):
                                 blocked_video_ids.append(video_id)
                             continue
                         state.seen.add(key)
+                    t["item_key"] = key
                     t.setdefault("scraped_at", received_at)
                     t["received_at"] = received_at
                     state.out_fh.write(json.dumps(t, ensure_ascii=False) + "\n")
                     accepted += 1
-                    if video_id:
+                    if key:
                         new_for_classify.append(t)
 
                 if topic and new_for_classify:
                     verdicts = classify_tiles(state, topic, new_for_classify)
                     state.relevance.update(verdicts)
 
-                for vid in all_video_ids:
-                    if state.relevance.get(vid):
+                for key in all_keys:
+                    if state.relevance.get(key):
+                        blocked_item_keys.append(key)
+                for t in tiles:
+                    if not isinstance(t, dict):
+                        continue
+                    vid = (t.get("video_id") or "").strip()
+                    key = (t.get("item_key") or t.get("video_id") or t.get("url") or "").strip()
+                    if vid and state.relevance.get(key):
                         blocked_video_ids.append(vid)
 
                 state.out_fh.flush()
@@ -229,6 +243,7 @@ def make_handler(state: State):
                 "received": len(tiles),
                 "accepted": accepted,
                 "topic": topic,
+                "blocked_item_keys": sorted(set(blocked_item_keys)),
                 "blocked_video_ids": sorted(set(blocked_video_ids)),
             })
 
