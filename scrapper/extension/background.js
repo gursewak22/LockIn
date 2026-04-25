@@ -6,6 +6,81 @@ const DEFAULT_ENDPOINT = "http://127.0.0.1:8765/tiles";
 const DEFAULT_MODE = "lookahead";
 const DEFAULT_INTERVAL_MIN = 0.05;
 
+function applyOverlayFn({ blockedVideoIds }) {
+  const blocked = new Set((blockedVideoIds || []).filter(Boolean));
+
+  // Reset previous overlays so each pass reflects the latest classifier output.
+  for (const old of document.querySelectorAll(".lockin-overlay")) old.remove();
+  for (const el of document.querySelectorAll("[data-lockin-blocked='1']")) {
+    el.removeAttribute("data-lockin-blocked");
+    if (el.dataset.lockinPrevPosition) {
+      el.style.position = el.dataset.lockinPrevPosition;
+      delete el.dataset.lockinPrevPosition;
+    }
+  }
+
+  if (blocked.size === 0) return { blockedCount: 0 };
+
+  const hostSelectors = [
+    "ytd-rich-item-renderer",
+    "ytd-video-renderer",
+    "ytd-grid-video-renderer",
+    "ytd-compact-video-renderer",
+    "ytd-playlist-video-renderer",
+    "ytd-reel-item-renderer",
+    "yt-lockup-view-model",
+  ];
+
+  const makeOverlay = () => {
+    const d = document.createElement("div");
+    d.className = "lockin-overlay";
+    d.textContent = "Blocked by LockIn";
+    Object.assign(d.style, {
+      position: "absolute",
+      inset: "0",
+      zIndex: "9999",
+      background: "rgba(20, 20, 20, 0.88)",
+      color: "#f5f5f5",
+      display: "grid",
+      placeItems: "center",
+      textAlign: "center",
+      fontWeight: "700",
+      fontSize: "14px",
+      letterSpacing: "0.2px",
+      backdropFilter: "blur(3px)",
+      pointerEvents: "auto",
+    });
+    return d;
+  };
+
+  const seenHosts = new Set();
+  let blockedCount = 0;
+
+  for (const vid of blocked) {
+    const esc = (window.CSS && CSS.escape) ? CSS.escape(vid) : vid;
+    const links = [
+      ...document.querySelectorAll(`a[href*='watch?v=${esc}']`),
+      ...document.querySelectorAll(`a[href*='/shorts/${esc}']`),
+    ];
+    for (const a of links) {
+      const host = a.closest(hostSelectors.join(","));
+      if (!host || seenHosts.has(host)) continue;
+      seenHosts.add(host);
+
+      const prevPos = getComputedStyle(host).position;
+      if (prevPos === "static") {
+        host.dataset.lockinPrevPosition = "static";
+        host.style.position = "relative";
+      }
+      host.dataset.lockinBlocked = "1";
+      host.appendChild(makeOverlay());
+      blockedCount += 1;
+    }
+  }
+
+  return { blockedCount };
+}
+
 function scrapeFn({ mode, lookahead }) {
   const SELECTORS = [
     "ytd-rich-item-renderer",
@@ -175,7 +250,11 @@ async function getYouTubeTab() {
 }
 
 async function scrapeAndSend() {
-  const { endpoint = DEFAULT_ENDPOINT, mode = DEFAULT_MODE } = await chrome.storage.local.get(["endpoint", "mode"]);
+  const {
+    endpoint = DEFAULT_ENDPOINT,
+    mode = DEFAULT_MODE,
+    topic = "",
+  } = await chrome.storage.local.get(["endpoint", "mode", "topic"]);
   const tab = await getYouTubeTab();
   if (!tab) {
     return { ok: false, reason: "No YouTube tab open." };
@@ -206,12 +285,24 @@ async function scrapeAndSend() {
     const resp = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tiles, page_url: tab.url }),
+      body: JSON.stringify({ tiles, page_url: tab.url, topic }),
     });
     if (!resp.ok) return { ok: false, reason: `Receiver returned ${resp.status}.`, counts };
     const data = await resp.json().catch(() => ({}));
     const accepted = typeof data.accepted === "number" ? data.accepted : tiles.length;
-    return { ok: true, sent: tiles.length, accepted, counts };
+    const blockedVideoIds = Array.isArray(data.blocked_video_ids) ? data.blocked_video_ids : [];
+    let blockedOnPage = 0;
+    try {
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: applyOverlayFn,
+        args: [{ blockedVideoIds }],
+      });
+      blockedOnPage = Number(result && result.blockedCount) || 0;
+    } catch (_) {
+      blockedOnPage = 0;
+    }
+    return { ok: true, sent: tiles.length, accepted, blocked: blockedOnPage, counts };
   } catch (e) {
     return { ok: false, reason: `Receiver unreachable (${e.message}). Is yt_receiver.py running on ${endpoint}?`, counts };
   }

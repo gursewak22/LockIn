@@ -9,7 +9,8 @@ function setWatchButton(on) {
 function describe(result) {
   if (!result) return "";
   if (!result.ok) return result.reason || "Failed.";
-  return `Sent ${result.sent ?? 0} tiles. New: ${result.accepted ?? 0}.`;
+  const blocked = Number(result.blocked || 0);
+  return `Sent ${result.sent ?? 0} tiles. New: ${result.accepted ?? 0}. Blocked on page: ${blocked}.`;
 }
 
 async function scrape() {
@@ -33,14 +34,16 @@ async function toggleWatch() {
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
-  const stored = await chrome.storage.local.get(["endpoint", "mode", "watchOn", "lastResult"]);
+  const stored = await chrome.storage.local.get(["endpoint", "mode", "topic", "watchOn", "lastResult"]);
   if (stored.endpoint) $("endpoint").value = stored.endpoint;
   if (stored.mode) $("mode").value = stored.mode;
+  if (stored.topic) $("topic").value = stored.topic;
   setWatchButton(!!stored.watchOn);
   if (stored.lastResult) setStatus(describe(stored.lastResult));
 
   $("endpoint").addEventListener("change", () => chrome.storage.local.set({ endpoint: $("endpoint").value }));
   $("mode").addEventListener("change", () => chrome.storage.local.set({ mode: $("mode").value }));
+  $("topic").addEventListener("change", () => chrome.storage.local.set({ topic: $("topic").value }));
   $("scrape").addEventListener("click", scrape);
   $("watch").addEventListener("click", toggleWatch);
 });
