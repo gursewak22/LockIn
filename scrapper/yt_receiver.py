@@ -14,6 +14,7 @@ import os
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -89,19 +90,25 @@ def llm_classify_irrelevant(state: State, topic: str, tiles: list[dict[str, Any]
         f"Items: {json.dumps(items, ensure_ascii=False)}"
     )
     payload = {
-        "model": state.llm_model,
-        "messages": [
-            {"role": "system", "content": "Return valid JSON only."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0,
+        "systemInstruction": {"parts": [{"text": "Return valid JSON only."}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0},
     }
+    try:
+        u = urllib.parse.urlparse(state.llm_url)
+        q = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+        if "key" not in q and state.llm_api_key:
+            q["key"] = [state.llm_api_key]
+        query = urllib.parse.urlencode(q, doseq=True)
+        request_url = urllib.parse.urlunparse((u.scheme, u.netloc, u.path, u.params, query, u.fragment))
+    except Exception:
+        request_url = state.llm_url
+
     req = urllib.request.Request(
-        state.llm_url,
+        request_url,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {state.llm_api_key}",
         },
         method="POST",
     )
@@ -110,7 +117,10 @@ def llm_classify_irrelevant(state: State, topic: str, tiles: list[dict[str, Any]
         with urllib.request.urlopen(req, timeout=20) as resp:
             raw = resp.read().decode("utf-8")
         data = json.loads(raw)
-        content = data["choices"][0]["message"]["content"]
+        candidates = data.get("candidates") or []
+        first = candidates[0] if candidates else {}
+        parts = ((first.get("content") or {}).get("parts") or [])
+        content = "\n".join(str(p.get("text") or "") for p in parts)
         parsed = json.loads(content)
         blocked = set(parsed.get("irrelevant_keys") or [])
         return {v["item_key"]: (v["item_key"] in blocked) for v in items}
@@ -270,17 +280,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out", default=None, help="Append NDJSON to this file instead of stdout.")
     p.add_argument("--no-dedup", action="store_true", help="Do not dedupe by video_id (write every tile).")
     p.add_argument("--topic", default="", help="Default relevance topic if extension does not send one.")
-    p.add_argument("--llm", action="store_true", help="Enable OpenAI-compatible LLM relevance classification.")
-    p.add_argument("--llm-model", default="gpt-4o-mini", help="Model name for --llm.")
-    p.add_argument("--llm-url", default="https://api.openai.com/v1/chat/completions",
-                   help="OpenAI-compatible chat completions URL for --llm.")
+    p.add_argument("--llm", action="store_true", help="Enable Gemini LLM relevance classification.")
+    p.add_argument("--llm-model", default="gemini-2.5-flash", help="Model name for --llm.")
+    p.add_argument("--llm-url", default="https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+                   help="Gemini generateContent URL for --llm.")
     return p.parse_args(argv)
 
 
 def main() -> int:
     args = parse_args()
     out_fh: IO[str] = open(args.out, "a", encoding="utf-8") if args.out else sys.stdout
-    llm_api_key = os.environ.get("OPENAI_API_KEY", "")
+    llm_api_key = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
     state = State(
         out_fh,
         dedup=not args.no_dedup,

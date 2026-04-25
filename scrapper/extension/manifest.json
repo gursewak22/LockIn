@@ -1,19 +1,27 @@
 {
   "manifest_version": 3,
-  "name": "YT Tile Scraper",
+  "name": "LockIn",
   "version": "0.1.0",
-  "description": "Scrape YouTube video-tile metadata from the active tab and POST it to a local Python receiver.",
-  "permissions": ["activeTab", "scripting", "storage", "alarms", "tabs"],
+  "description": "Scrape YouTube tiles, classify them against a local profile, and block irrelevant content in-page.",
+  "permissions": ["activeTab", "scripting", "storage", "alarms", "tabs", "permissions"],
   "host_permissions": [
     "*://*.youtube.com/*",
     "http://127.0.0.1:8765/*",
     "http://localhost:8765/*"
   ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Scrape YouTube tiles",
+    "default_title": "LockIn",
     "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   }
 }
